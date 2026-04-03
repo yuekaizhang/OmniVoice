@@ -5,7 +5,8 @@ import torchaudio
 model = OmniVoice.from_pretrained(
     "/workspace_yuekai/HF/OmniVoice",
     device_map="cuda:0",
-    dtype=torch.float16
+    dtype=torch.float16,
+    attn_implementation="flash_attention_2"
 )
 # Apple Silicon users: use device_map="mps" instead
 
@@ -18,4 +19,4 @@ audio = model.generate(
 # If you don't want to input `ref_text` manually, you can directly omit the `ref_text`.
 # The model will use Whisper ASR to auto-transcribe it.
 
-torchaudio.save("out.wav", audio[0], 24000)
+torchaudio.save("out2.wav", audio[0], 24000)

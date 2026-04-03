@@ -197,10 +197,25 @@ def get_parser():
         "language_id/language_name fields. If provided, both language_id and "
         "language_name will be set to this value.",
     )
+    parser.add_argument(
+        "--no_sort",
+        type=str2bool,
+        default=False,
+        help="Disable sorting by duration when batching. "
+        "Keeps original order from the test list.",
+    )
+    parser.add_argument(
+        "--attn_implementation",
+        type=str,
+        default=None,
+        help='Attention implementation for the LLM backbone. '
+        'Set to "flash_attention_2" to use FlashAttention-2 with varlen '
+        'for faster inference. Requires flash-attn to be installed.',
+    )
     return parser
 
 
-def process_init(rank_queue, model_checkpoint, warmup=0):
+def process_init(rank_queue, model_checkpoint, warmup=0, attn_implementation=None):
     """Initializer for each worker process.
 
     Loads model (with tokenizers and duration estimator) onto a specific GPU
@@ -228,10 +243,15 @@ def process_init(rank_queue, model_checkpoint, warmup=0):
 
     logging.info(f"Initializing worker on device: {worker_device}")
 
+    extra_kwargs = {}
+    if attn_implementation is not None:
+        extra_kwargs["attn_implementation"] = attn_implementation
+
     worker_model = OmniVoice.from_pretrained(
         model_checkpoint,
         device_map=worker_device,
         dtype=torch.float16,
+        **extra_kwargs,
     )
 
     if warmup > 0:
@@ -317,30 +337,35 @@ def cluster_samples_by_batch_size(
     samples: List[Tuple],
     duration_estimator: RuleDurationEstimator,
     batch_size: int,
+    no_sort: bool = False,
 ) -> List[List[Tuple]]:
     """Split samples into fixed-size batches, sorted by duration to minimize padding."""
-    sample_with_duration = []
-    for sample in samples:
-        save_name, ref_text, ref_audio_path, text, lang_id, lang_name, dur, spd = sample
-        total_duration = estimate_sample_total_duration(
-            duration_estimator,
-            text,
-            ref_text,
-            ref_audio_path,
-            gen_duration=dur,
-        )
-        sample_with_duration.append((sample, total_duration))
+    if no_sort:
+        ordered_samples = samples
+    else:
+        sample_with_duration = []
+        for sample in samples:
+            save_name, ref_text, ref_audio_path, text, lang_id, lang_name, dur, spd = sample
+            total_duration = estimate_sample_total_duration(
+                duration_estimator,
+                text,
+                ref_text,
+                ref_audio_path,
+                gen_duration=dur,
+            )
+            sample_with_duration.append((sample, total_duration))
 
-    sample_with_duration.sort(key=lambda x: x[1], reverse=True)
-    sorted_samples = [s for s, _ in sample_with_duration]
+        sample_with_duration.sort(key=lambda x: x[1], reverse=True)
+        ordered_samples = [s for s, _ in sample_with_duration]
 
     batches = [
-        sorted_samples[i : i + batch_size]
-        for i in range(0, len(sorted_samples), batch_size)
+        ordered_samples[i : i + batch_size]
+        for i in range(0, len(ordered_samples), batch_size)
     ]
+    sort_label = "unsorted" if no_sort else "sorted by duration"
     logging.info(
         f"Split {len(samples)} samples into {len(batches)} batches "
-        f"(fixed batch_size={batch_size}, sorted by duration)"
+        f"(fixed batch_size={batch_size}, {sort_label})"
     )
     return batches
 
@@ -453,7 +478,7 @@ def main():
         with ProcessPoolExecutor(
             max_workers=num_processes,
             initializer=process_init,
-            initargs=(rank_queue, args.model, args.warmup),
+            initargs=(rank_queue, args.model, args.warmup, args.attn_implementation),
         ) as executor:
             futures = []
 
@@ -463,7 +488,8 @@ def main():
             duration_estimator = RuleDurationEstimator()
             if args.batch_size > 0:
                 batches = cluster_samples_by_batch_size(
-                    samples, duration_estimator, args.batch_size
+                    samples, duration_estimator, args.batch_size,
+                    no_sort=args.no_sort,
                 )
             else:
                 batches = cluster_samples_by_duration(
