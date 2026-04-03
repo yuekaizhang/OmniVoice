@@ -100,6 +100,7 @@ class OmniVoiceGenerationConfig:
     postprocess_output: bool = True
     audio_chunk_duration: float = 15.0
     audio_chunk_threshold: float = 30.0
+    use_cuda_graph: bool = False
 
     @classmethod
     def from_dict(cls, kwargs_dict):
@@ -151,6 +152,11 @@ class OmniVoiceModelOutput(ModelOutput):
 # ---------------------------------------------------------------------------
 # Config & Model
 # ---------------------------------------------------------------------------
+
+
+def _pad_to_bucket(seq_len, bucket=64):
+    """Round *seq_len* up to the nearest multiple of *bucket*."""
+    return ((seq_len + bucket - 1) // bucket) * bucket
 
 
 class OmniVoiceConfig(PretrainedConfig):
@@ -225,6 +231,129 @@ class OmniVoice(PreTrainedModel):
         self.duration_estimator = None
         self.sampling_rate = None
         self._asr_pipe = None
+
+        # CUDA graph acceleration
+        self._cuda_graph_cache = {}   # key: (2*B, padded_seq_len, use_flash)
+        self._cuda_graph_pool = None
+
+    # ------------------------------------------------------------------
+    # CUDA Graph helpers
+    # ------------------------------------------------------------------
+
+    @torch.no_grad()
+    def _capture_cuda_graph(self, key, batch_dim, padded_len, use_flash):
+        """Capture a single CUDA graph for the given tensor shape."""
+        C = self.config.num_audio_codebook
+
+        static_input_ids = torch.full(
+            (batch_dim, C, padded_len),
+            self.config.audio_mask_id,
+            dtype=torch.long,
+            device=self.device,
+        )
+        static_audio_mask = torch.zeros(
+            batch_dim, padded_len, dtype=torch.bool, device=self.device
+        )
+        if use_flash:
+            static_attn_mask = torch.ones(
+                batch_dim, padded_len, dtype=torch.bool, device=self.device
+            )
+        else:
+            static_attn_mask = torch.ones(
+                batch_dim, 1, padded_len, padded_len,
+                dtype=torch.bool, device=self.device,
+            )
+
+        fwd_kwargs = {"is_causal": False} if use_flash else {}
+
+        # Warmup run
+        self(
+            input_ids=static_input_ids,
+            audio_mask=static_audio_mask,
+            attention_mask=static_attn_mask,
+            **fwd_kwargs,
+        )
+
+        # Capture
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, pool=self._cuda_graph_pool):
+            out = self(
+                input_ids=static_input_ids,
+                audio_mask=static_audio_mask,
+                attention_mask=static_attn_mask,
+                **fwd_kwargs,
+            )
+            static_logits = out.logits.float()
+
+        if self._cuda_graph_pool is None:
+            self._cuda_graph_pool = graph.pool()
+
+        self._cuda_graph_cache[key] = {
+            "graph": graph,
+            "input_ids": static_input_ids,
+            "audio_mask": static_audio_mask,
+            "attention_mask": static_attn_mask,
+            "logits": static_logits,
+        }
+
+    @torch.no_grad()
+    def warmup_cuda_graph(self, batch_sizes=None, duration_list=None):
+        """Pre-capture CUDA graphs for common (batch_size, duration) combos."""
+        if batch_sizes is None:
+            batch_sizes = [1, 4]
+        if duration_list is None:
+            duration_list = [5, 10, 15, 20, 25, 30]
+
+        frame_rate = self.audio_tokenizer.config.frame_rate
+        use_flash = (
+            getattr(self.llm.config, "_attn_implementation", None)
+            == "flash_attention_2"
+        )
+        self.eval()
+
+        captured = set()
+        for B in batch_sizes:
+            for dur in duration_list:
+                target_tokens = int(dur * frame_rate)
+                for overhead in [256, 512]:
+                    padded_len = _pad_to_bucket(target_tokens + overhead)
+                    key = (2 * B, padded_len, use_flash)
+                    if key not in captured and key not in self._cuda_graph_cache:
+                        self._capture_cuda_graph(key, 2 * B, padded_len, use_flash)
+                        captured.add(key)
+
+        logger.info(
+            "Pre-captured %d CUDA graphs for %d batch sizes x %d durations",
+            len(captured),
+            len(batch_sizes),
+            len(duration_list),
+        )
+
+    def _find_cuda_graph_entry(self, batch_dim, padded_seq_len, use_flash):
+        """Find the smallest cached graph whose dims >= the requested ones.
+
+        Returns ``(key, entry)`` or ``(None, None)`` when no fit exists.
+        """
+        best_key = None
+        best_cost = float("inf")
+        for key, entry in self._cuda_graph_cache.items():
+            cached_batch, cached_seq, cached_flash = key
+            if cached_flash != use_flash:
+                continue
+            if cached_batch < batch_dim or cached_seq < padded_seq_len:
+                continue
+            cost = cached_batch * cached_seq
+            if cost < best_cost:
+                best_cost = cost
+                best_key = key
+        if best_key is not None:
+            return best_key, self._cuda_graph_cache[best_key]
+        return None, None
+
+    def clear_cuda_graph_cache(self):
+        """Release all cached CUDA graphs and the memory pool."""
+        self._cuda_graph_cache.clear()
+        self._cuda_graph_pool = None
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, *args, **kwargs):
@@ -1230,13 +1359,67 @@ class OmniVoice(PreTrainedModel):
         if use_flash:
             forward_kwargs["is_causal"] = False
 
+        # ----- CUDA graph path -----
+        use_cg = (
+            gen_config.use_cuda_graph
+            and self.device.type == "cuda"
+        )
+        entry = None
+        if use_cg:
+            padded_c_len = _pad_to_bucket(max_c_len)
+            need_batch = 2 * B
+            cg_key, entry = self._find_cuda_graph_entry(
+                need_batch, padded_c_len, use_flash
+            )
+            if entry is None:
+                cached_keys = [
+                    k for k in self._cuda_graph_cache if k[2] == use_flash
+                ]
+                logger.warning(
+                    "CUDA graph cache miss: need (batch=%d, seq=%d, flash=%s), "
+                    "available keys: %s  — falling back to eager",
+                    need_batch, padded_c_len, use_flash, cached_keys,
+                )
+                use_cg = False
+            elif cg_key != (need_batch, padded_c_len, use_flash):
+                logger.info(
+                    "CUDA graph: (batch=%d, seq=%d) → using cached "
+                    "(batch=%d, seq=%d)",
+                    need_batch, padded_c_len, cg_key[0], cg_key[1],
+                )
+
+        if use_cg:
+            # Copy constant masks into the graph's static buffers
+            entry["audio_mask"].zero_()
+            entry["audio_mask"][:2 * B, :max_c_len] = batch_audio_mask
+
+            entry["attention_mask"].fill_(False)
+            if use_flash:
+                entry["attention_mask"][:2 * B, :max_c_len] = batch_attention_mask
+                # Give padded batch rows one valid position to avoid NaN
+                if cg_key[0] > 2 * B:
+                    entry["attention_mask"][2 * B :, 0] = True
+            else:
+                entry["attention_mask"][
+                    :2 * B, :, :max_c_len, :max_c_len
+                ] = batch_attention_mask
+                if cg_key[0] > 2 * B:
+                    entry["attention_mask"][2 * B :, :, 0, 0] = True
+
         for step in range(gen_config.num_step):
-            batch_logits = self(
-                input_ids=batch_input_ids,
-                audio_mask=batch_audio_mask,
-                attention_mask=batch_attention_mask,
-                **forward_kwargs,
-            ).logits.to(torch.float32)
+            if use_cg:
+                # Copy current input_ids into static buffer and replay
+                entry["input_ids"].fill_(self.config.audio_mask_id)
+                entry["input_ids"][:2 * B, :, :max_c_len] = batch_input_ids
+                entry["graph"].replay()
+                batch_logits = entry["logits"][:2 * B, :, :max_c_len, :]
+            else:
+                batch_logits = self(
+                    input_ids=batch_input_ids,
+                    audio_mask=batch_audio_mask,
+                    attention_mask=batch_attention_mask,
+                    **forward_kwargs,
+                ).logits.to(torch.float32)
 
             for i in range(B):
                 k = schedules[i][step]

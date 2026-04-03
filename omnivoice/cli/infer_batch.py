@@ -212,10 +212,36 @@ def get_parser():
         'Set to "flash_attention_2" to use FlashAttention-2 with varlen '
         'for faster inference. Requires flash-attn to be installed.',
     )
+    parser.add_argument(
+        "--use_cuda_graph",
+        type=str2bool,
+        default=False,
+        help="Enable CUDA graph acceleration for the iterative decoding loop.",
+    )
+    parser.add_argument(
+        "--cuda_graph_batch_sizes",
+        type=str,
+        default="1,4",
+        help="Comma-separated batch sizes to pre-capture CUDA graphs for.",
+    )
+    parser.add_argument(
+        "--cuda_graph_duration_list",
+        type=str,
+        default="5,10,15,20,25,30",
+        help="Comma-separated durations (seconds) to pre-capture CUDA graphs for.",
+    )
     return parser
 
 
-def process_init(rank_queue, model_checkpoint, warmup=0, attn_implementation=None):
+def process_init(
+    rank_queue,
+    model_checkpoint,
+    warmup=0,
+    attn_implementation=None,
+    use_cuda_graph=False,
+    cuda_graph_batch_sizes=None,
+    cuda_graph_duration_list=None,
+):
     """Initializer for each worker process.
 
     Loads model (with tokenizers and duration estimator) onto a specific GPU
@@ -268,6 +294,13 @@ def process_init(rank_queue, model_checkpoint, warmup=0, attn_implementation=Non
                 ref_text=["hello"],
             )
         logging.info(f"Warmup complete on {worker_device}")
+
+    if use_cuda_graph and worker_device.startswith("cuda"):
+        logging.info("Pre-capturing CUDA graphs on %s", worker_device)
+        worker_model.warmup_cuda_graph(
+            batch_sizes=cuda_graph_batch_sizes,
+            duration_list=cuda_graph_duration_list,
+        )
 
     logging.info(f"Worker on {worker_device} initialized successfully.")
 
@@ -475,10 +508,22 @@ def main():
     total_audio_duration = []
 
     try:
+        # Parse CUDA graph args
+        cg_batch_sizes = [int(x) for x in args.cuda_graph_batch_sizes.split(",")]
+        cg_duration_list = [float(x) for x in args.cuda_graph_duration_list.split(",")]
+
         with ProcessPoolExecutor(
             max_workers=num_processes,
             initializer=process_init,
-            initargs=(rank_queue, args.model, args.warmup, args.attn_implementation),
+            initargs=(
+                rank_queue,
+                args.model,
+                args.warmup,
+                args.attn_implementation,
+                args.use_cuda_graph,
+                cg_batch_sizes,
+                cg_duration_list,
+            ),
         ) as executor:
             futures = []
 
