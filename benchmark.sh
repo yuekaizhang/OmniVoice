@@ -1,0 +1,1 @@
+CUDA_VISIBLE_DEVICES=0 python3 -m omnivoice.cli.infer_batch --test_list rtf_evaluation/test_rtf.jsonl --warmup 5 --num_step 16 --batch_size 4 --res_dir results/rtf/
