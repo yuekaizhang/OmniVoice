@@ -1160,9 +1160,11 @@ class OmniVoice(PreTrainedModel):
             (2 * B, max_c_len), dtype=torch.bool, device=self.device
         )
         use_flash = getattr(self.llm.config, "_attn_implementation", None) == "flash_attention_2"
+        use_trt = getattr(self.llm, "_is_trt", False)
+        use_2d_mask = use_flash or use_trt
 
-        if use_flash:
-            # 2D padding mask — flash_attention_2 internally handles unpad + varlen
+        if use_2d_mask:
+            # 2D padding mask — flash_attention_2 / TRT handle it internally
             batch_attention_mask = torch.zeros(
                 (2 * B, max_c_len), dtype=torch.bool, device=self.device
             )
@@ -1178,7 +1180,7 @@ class OmniVoice(PreTrainedModel):
             # Cond (0 ~ B-1)
             batch_input_ids[i, :, :c_len] = inp["input_ids"]
             batch_audio_mask[i, :c_len] = inp["audio_mask"]
-            if use_flash:
+            if use_2d_mask:
                 batch_attention_mask[i, :c_len] = True
             else:
                 batch_attention_mask[i, :, :c_len, :c_len] = True
@@ -1186,7 +1188,7 @@ class OmniVoice(PreTrainedModel):
             # Uncond (B ~ 2B-1)
             batch_input_ids[B + i, :, :u_len] = inp["input_ids"][..., -u_len:]
             batch_audio_mask[B + i, :u_len] = inp["audio_mask"][..., -u_len:]
-            if use_flash:
+            if use_2d_mask:
                 batch_attention_mask[B + i, :u_len] = True
             else:
                 batch_attention_mask[B + i, :, :u_len, :u_len] = True

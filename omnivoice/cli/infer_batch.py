@@ -212,10 +212,23 @@ def get_parser():
         'Set to "flash_attention_2" to use FlashAttention-2 with varlen '
         'for faster inference. Requires flash-attn to be installed.',
     )
+    parser.add_argument(
+        "--llm_trt_engine_path",
+        type=str,
+        default=None,
+        help="Path to a TensorRT engine (.plan) for the LLM backbone. "
+        "If set, replaces the PyTorch LLM with a TRT engine.",
+    )
     return parser
 
 
-def process_init(rank_queue, model_checkpoint, warmup=0, attn_implementation=None):
+def process_init(
+    rank_queue,
+    model_checkpoint,
+    warmup=0,
+    attn_implementation=None,
+    llm_trt_engine_path=None,
+):
     """Initializer for each worker process.
 
     Loads model (with tokenizers and duration estimator) onto a specific GPU
@@ -253,6 +266,11 @@ def process_init(rank_queue, model_checkpoint, warmup=0, attn_implementation=Non
         dtype=torch.float16,
         **extra_kwargs,
     )
+
+    if llm_trt_engine_path:
+        from omnivoice.utils.tensorrt import load_llm_trt
+
+        load_llm_trt(worker_model, llm_trt_engine_path, device=worker_device)
 
     if warmup > 0:
         logging.info(f"Running {warmup} warmup iterations on {worker_device}")
@@ -478,7 +496,7 @@ def main():
         with ProcessPoolExecutor(
             max_workers=num_processes,
             initializer=process_init,
-            initargs=(rank_queue, args.model, args.warmup, args.attn_implementation),
+            initargs=(rank_queue, args.model, args.warmup, args.attn_implementation, args.llm_trt_engine_path),
         ) as executor:
             futures = []
 

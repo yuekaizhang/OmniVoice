@@ -115,6 +115,13 @@ def get_parser() -> argparse.ArgumentParser:
         default=None,
         help="Device to use for inference. Auto-detected if not specified.",
     )
+    parser.add_argument(
+        "--llm_trt_engine_path",
+        type=str,
+        default=None,
+        help="Path to a TensorRT engine (.plan) for the LLM backbone. "
+        "If set, replaces the PyTorch LLM with a TRT engine.",
+    )
     return parser
 
 
@@ -129,6 +136,11 @@ def main():
     model = OmniVoice.from_pretrained(
         args.model, device_map=device, dtype=torch.float16
     )
+
+    if args.llm_trt_engine_path:
+        from omnivoice.utils.tensorrt import load_llm_trt
+
+        load_llm_trt(model, args.llm_trt_engine_path)
 
     logging.info(f"Generating audio for: {args.text[:80]}...")
     audios = model.generate(
