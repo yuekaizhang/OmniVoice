@@ -402,11 +402,16 @@ class OmniVoice(PreTrainedModel):
         )
         hidden_states = llm_outputs[0]
 
+        # Upcast to FP32 before audio_heads when using TRT to avoid
+        # BF16 precision loss accumulating through the projection.
+        if getattr(self.llm, "_is_trt", False):
+            hidden_states = hidden_states.float()
+
         loss = None
 
         # Shape: [B, S, C * Vocab]
         batch_size, seq_len, _ = hidden_states.shape
-        logits_flat = self.audio_heads(hidden_states)
+        logits_flat = F.linear(hidden_states, self.audio_heads.weight.float())
         # Shape: [B, S, C, Vocab] -> [B, C, S, Vocab]
         audio_logits = logits_flat.view(
             batch_size,

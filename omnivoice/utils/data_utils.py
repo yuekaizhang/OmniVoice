@@ -23,6 +23,7 @@ Provides ``read_test_list()`` to parse JSONL test list files used by
 
 import json
 import logging
+import os
 from pathlib import Path
 
 
@@ -60,4 +61,57 @@ def read_test_list(path):
                 "speed": obj.get("speed"),
             }
             samples.append(sample)
+    return samples
+
+
+def read_hf_dataset(dataset_name, split, audio_cache_dir):
+    """Load a HuggingFace dataset and convert to the same format as read_test_list.
+
+    Expected dataset fields:
+        id, prompt_text, prompt_audio (with array + sampling_rate), target_text.
+
+    Prompt audio arrays are saved as WAV files under ``audio_cache_dir`` so the
+    existing batch inference pipeline can load them by path.
+
+    Returns a list of dicts matching the ``read_test_list`` schema.
+    """
+    import numpy as np
+    import torch
+    import torchaudio
+    from datasets import load_dataset
+
+    logging.info(
+        f"Loading HuggingFace dataset '{dataset_name}' split='{split}' ..."
+    )
+    dataset = load_dataset(dataset_name, split=split)
+    logging.info(f"Loaded {len(dataset)} samples from HF dataset")
+
+    os.makedirs(audio_cache_dir, exist_ok=True)
+
+    samples = []
+    for item in dataset:
+        sample_id = item["id"]
+        ref_text = item["prompt_text"]
+        target_text = item["target_text"]
+
+        # Save prompt audio to wav file
+        audio_array = np.asarray(item["prompt_audio"]["array"], dtype=np.float32)
+        sr = item["prompt_audio"]["sampling_rate"]
+        audio_tensor = torch.from_numpy(audio_array).unsqueeze(0)
+        audio_path = os.path.join(audio_cache_dir, f"{sample_id}.wav")
+        torchaudio.save(audio_path, audio_tensor, sr)
+
+        samples.append(
+            {
+                "id": sample_id,
+                "text": target_text,
+                "ref_audio": audio_path,
+                "ref_text": ref_text,
+                "language_id": None,
+                "language_name": None,
+                "duration": None,
+                "speed": None,
+            }
+        )
+
     return samples

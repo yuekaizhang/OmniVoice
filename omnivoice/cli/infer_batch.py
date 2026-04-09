@@ -48,7 +48,7 @@ from tqdm import tqdm
 from omnivoice.models.omnivoice import OmniVoice
 from omnivoice.utils.audio import load_audio
 from omnivoice.utils.common import str2bool
-from omnivoice.utils.data_utils import read_test_list
+from omnivoice.utils.data_utils import read_hf_dataset, read_test_list
 from omnivoice.utils.duration import RuleDurationEstimator
 
 
@@ -77,13 +77,30 @@ def get_parser():
     parser.add_argument(
         "--test_list",
         type=str,
-        required=True,
+        default=None,
         help="Path to the JSONL file containing test samples. "
         'Each line is a JSON object: {"id": "name", "text": "...", '
         '"ref_audio": "/path.wav", "ref_text": "...", '
         '"language_id": "en", "language_name": "English", '
         '"duration": 10.0, "speed": 1.2}. '
-        "language_id, language_name, duration, and speed are optional.",
+        "language_id, language_name, duration, and speed are optional. "
+        "Mutually exclusive with --huggingface_dataset.",
+    )
+    parser.add_argument(
+        "--huggingface_dataset",
+        type=str,
+        default=None,
+        help="HuggingFace dataset name (e.g. 'yuekai/seed_tts_cosy2'). "
+        "Expected fields: id, prompt_text, prompt_audio, target_text. "
+        "Duration is auto-estimated from prompt text/audio and target text. "
+        "Mutually exclusive with --test_list.",
+    )
+    parser.add_argument(
+        "--split",
+        type=str,
+        default=None,
+        help="Dataset split to use (e.g. 'wenetspeech4tts'). "
+        "Required when --huggingface_dataset is set.",
     )
     parser.add_argument(
         "--res_dir",
@@ -467,7 +484,22 @@ def main():
     for rank in list(range(num_devices)) * args.nj_per_gpu:
         rank_queue.put((device_type, rank))
 
-    samples_raw = read_test_list(args.test_list)
+    if args.huggingface_dataset:
+        if not args.split:
+            raise ValueError("--split is required when using --huggingface_dataset")
+        if args.test_list:
+            raise ValueError(
+                "--test_list and --huggingface_dataset are mutually exclusive"
+            )
+        audio_cache_dir = os.path.join(args.res_dir, "hf_audio_cache")
+        samples_raw = read_hf_dataset(
+            args.huggingface_dataset, args.split, audio_cache_dir
+        )
+    elif args.test_list:
+        samples_raw = read_test_list(args.test_list)
+    else:
+        raise ValueError("Either --test_list or --huggingface_dataset is required")
+
     samples = []
     for s in samples_raw:
         if args.lang_id is not None:

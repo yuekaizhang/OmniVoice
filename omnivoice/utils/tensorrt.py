@@ -161,7 +161,7 @@ class TrtLLMWrapper:
 
         self._release(estimator, stream)
 
-        return (output.to(inputs_embeds.dtype),)
+        return (output,)
 
 
 def load_llm_trt(

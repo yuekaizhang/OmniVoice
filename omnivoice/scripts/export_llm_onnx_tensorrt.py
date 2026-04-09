@@ -83,7 +83,9 @@ class LLMForONNXExport(nn.Module):
         key_pad = attention_mask.unsqueeze(1).unsqueeze(2)  # [B, 1, 1, S]
         S = inputs_embeds.size(1)
         mask_4d = key_pad.expand(-1, 1, S, S).to(inputs_embeds.dtype)  # [B,1,S,S]
-        mask_4d = (1.0 - mask_4d) * torch.finfo(inputs_embeds.dtype).min
+        # Use -65504 (FP16-safe) instead of torch.finfo(fp32).min (-3.4e38)
+        # which overflows FP16 and causes NaN in FP16 TRT engines.
+        mask_4d = (1.0 - mask_4d) * (-65504.0)
 
         outputs = self.llm(
             inputs_embeds=inputs_embeds,
@@ -266,11 +268,227 @@ def get_trt_profiles(
     }
 
 
+def _apply_mixed_precision(network, config, trt, level: int) -> None:
+    """Apply layer-level FP32 precision constraints to a TRT network.
+
+    Levels:
+        1 — Non-MatMul float ops → FP32 (Softmax, LayerNorm, ElementWise, Unary).
+            All MatMul stays in low precision.  (~312 / 11804 layers)
+        2 — Level 1  +  attention MatMul → FP32.
+            Only FFN MatMul (mlp/ffn keywords in name) stays in low precision.
+        3 — ALL layers → FP32 (essentially FP32 compute with BF16 I/O).
+    """
+    config.set_flag(trt.BuilderFlag.OBEY_PRECISION_CONSTRAINTS)
+
+    # Layer types that are integer/shape ops — never touch these
+    _SKIP_TYPES = set()
+    for name in (
+        "SHAPE", "CONSTANT", "IDENTITY", "GATHER", "SLICE",
+        "SHUFFLE", "CONCATENATION", "FILL", "CONDITION", "ASSERTION",
+        "CONDITIONAL_INPUT", "CONDITIONAL_OUTPUT",
+    ):
+        if hasattr(trt.LayerType, name):
+            _SKIP_TYPES.add(getattr(trt.LayerType, name))
+
+    # Float compute layers that should always be FP32 at level >= 1
+    _ALWAYS_FP32_TYPES = {trt.LayerType.SOFTMAX, trt.LayerType.REDUCE}
+    if hasattr(trt.LayerType, "NORMALIZATION"):
+        _ALWAYS_FP32_TYPES.add(trt.LayerType.NORMALIZATION)
+
+    _ARITHMETIC_OPS = {
+        trt.ElementWiseOperation.SUM,
+        trt.ElementWiseOperation.SUB,
+        trt.ElementWiseOperation.PROD,
+        trt.ElementWiseOperation.DIV,
+        trt.ElementWiseOperation.POW,
+    }
+
+    # FFN keywords — at level 2 these MatMul layers stay in low precision
+    _FFN_KW = {"mlp", "feed_forward", "ffn", "gate_proj", "up_proj",
+               "down_proj", "fc1", "fc2", "w1", "w2", "w3"}
+
+    fp32_count = 0
+    bf16_matmul_names = []
+
+    for i in range(network.num_layers):
+        layer = network.get_layer(i)
+        ltype = layer.type
+        lname = layer.name or ""
+
+        if ltype in _SKIP_TYPES:
+            continue
+
+        # --- MatMul / Conv ---
+        if ltype in (trt.LayerType.MATRIX_MULTIPLY, trt.LayerType.CONVOLUTION):
+            if level >= 3:
+                # Level 3: ALL matmul → FP32
+                layer.precision = trt.DataType.FLOAT
+                fp32_count += 1
+            elif level >= 2:
+                # Level 2: FFN matmul stays BF16, rest → FP32
+                is_ffn = any(kw in lname.lower() for kw in _FFN_KW)
+                if is_ffn:
+                    bf16_matmul_names.append(lname)
+                else:
+                    layer.precision = trt.DataType.FLOAT
+                    fp32_count += 1
+            else:
+                # Level 1: all matmul stays in low precision
+                bf16_matmul_names.append(lname)
+            continue
+
+        # --- Always-FP32 types (Softmax, Reduce, Normalization) ---
+        if ltype in _ALWAYS_FP32_TYPES:
+            layer.precision = trt.DataType.FLOAT
+            fp32_count += 1
+            continue
+
+        # --- ElementWise: only arithmetic ops → FP32 ---
+        if ltype == trt.LayerType.ELEMENTWISE:
+            try:
+                if layer.op in _ARITHMETIC_OPS:
+                    layer.precision = trt.DataType.FLOAT
+                    fp32_count += 1
+            except Exception:
+                pass
+            continue
+
+        # --- Unary (sqrt, rsqrt, exp, …) ---
+        if ltype == trt.LayerType.UNARY:
+            try:
+                layer.precision = trt.DataType.FLOAT
+                fp32_count += 1
+            except Exception:
+                pass
+            continue
+
+        # --- Level 3: force remaining float layers too ---
+        if level >= 3:
+            try:
+                layer.precision = trt.DataType.FLOAT
+                fp32_count += 1
+            except Exception:
+                pass
+
+    logger.info(
+        "Mixed-precision level %d: %d / %d layers → FP32, "
+        "%d MatMul/Conv kept in low precision",
+        level, fp32_count, network.num_layers, len(bf16_matmul_names),
+    )
+    if bf16_matmul_names and level >= 2:
+        logger.info(
+            "Low-precision MatMul layers (FFN): %s",
+            bf16_matmul_names[:10],
+        )
+
+
+def _apply_onnx_mixed_precision(onnx_path: str, output_path: str) -> None:
+    """Modify an FP32 ONNX graph so that FFN MatMul ops use BF16 weights.
+
+    For each FFN MatMul (gate_proj, up_proj, down_proj):
+      - Convert the weight initializer from FP32 to BF16
+      - Insert Cast(to=BFLOAT16) before the activation input
+      - Insert Cast(to=FLOAT) after the MatMul output
+
+    This gives TensorRT an explicit mixed-precision signal at the ONNX level,
+    avoiding the global BF16 builder flag that quantises *all* weights.
+    """
+    import onnx
+    import onnx_graphsurgeon as gs
+    from ml_dtypes import bfloat16
+
+    logger.info("Applying ONNX-level mixed precision to FFN MatMul nodes …")
+    graph = gs.import_onnx(onnx.load(onnx_path))
+
+    _FFN_KW = {"gate_proj", "up_proj", "down_proj"}
+    modified = 0
+
+    for node in list(graph.nodes):
+        if node.op != "MatMul":
+            continue
+        # Match FFN MatMul by checking if any FFN keyword appears in the node name
+        if not any(kw in node.name for kw in _FFN_KW):
+            continue
+
+        # Identify weight (Constant) and activation inputs
+        weight_idx = None
+        act_idx = None
+        for i, inp in enumerate(node.inputs):
+            if isinstance(inp, gs.Constant) and inp.values is not None:
+                weight_idx = i
+            else:
+                act_idx = i
+        if weight_idx is None or act_idx is None:
+            logger.warning("Skipping %s: cannot identify weight/activation inputs", node.name)
+            continue
+
+        weight_tensor = node.inputs[weight_idx]
+        act_tensor = node.inputs[act_idx]
+
+        # 1. Convert weight from FP32 to BF16
+        fp32_vals = weight_tensor.values
+        bf16_vals = fp32_vals.astype(bfloat16)
+        weight_bf16 = gs.Constant(
+            name=weight_tensor.name + "_bf16",
+            values=bf16_vals,
+        )
+
+        # 2. Insert Cast(to=BFLOAT16) on the activation input
+        act_bf16 = gs.Variable(
+            name=act_tensor.name + f"_bf16_{node.name}",
+            dtype=None,
+        )
+        cast_to_bf16 = gs.Node(
+            op="Cast",
+            name=f"{node.name}_cast_act_to_bf16",
+            inputs=[act_tensor],
+            outputs=[act_bf16],
+            attrs={"to": onnx.TensorProto.BFLOAT16},
+        )
+
+        # 3. The MatMul now operates in BF16 — create a new BF16 output
+        matmul_out_bf16 = gs.Variable(
+            name=node.outputs[0].name + "_bf16",
+            dtype=None,
+        )
+        original_output = node.outputs[0]
+
+        # 4. Insert Cast(to=FLOAT) after MatMul
+        cast_to_fp32 = gs.Node(
+            op="Cast",
+            name=f"{node.name}_cast_out_to_fp32",
+            inputs=[matmul_out_bf16],
+            outputs=[original_output],
+            attrs={"to": onnx.TensorProto.FLOAT},
+        )
+
+        # Rewire: MatMul inputs become [act_bf16, weight_bf16] (preserve order)
+        if act_idx == 0:
+            node.inputs = [act_bf16, weight_bf16]
+        else:
+            node.inputs = [weight_bf16, act_bf16]
+        # MatMul output becomes the BF16 intermediate
+        node.outputs = [matmul_out_bf16]
+
+        # Insert new nodes into the graph
+        graph.nodes.append(cast_to_bf16)
+        graph.nodes.append(cast_to_fp32)
+        modified += 1
+
+    graph.cleanup().toposort()
+    onnx.save(gs.export_onnx(graph), output_path)
+    logger.info(
+        "ONNX mixed precision: modified %d FFN MatMul nodes → %s",
+        modified, output_path,
+    )
+
+
 def convert_onnx_to_trt(
     trt_path: str,
     onnx_path: str,
     profiles: Dict,
     dtype: torch.dtype = torch.float16,
+    mixed_precision: int = 0,
 ) -> None:
     import tensorrt as trt
 
@@ -283,7 +501,25 @@ def convert_onnx_to_trt(
     parser = trt.OnnxParser(network, trt_logger)
     config = builder.create_builder_config()
 
-    if dtype == torch.float16:
+    # Level 3: no BF16/FP16 flag — pure FP32 compute/storage.
+    # Level 4: BF16 flag ON — FFN weights are already BF16 in the ONNX graph,
+    #          and we apply level 2 constraints (attention FP32) via TRT API.
+    if mixed_precision == 3:
+        logger.info(
+            "mixed-precision level 3: skipping %s builder flag (all layers FP32)",
+            dtype,
+        )
+    elif mixed_precision == 4:
+        if dtype == torch.bfloat16:
+            config.set_flag(trt.BuilderFlag.BF16)
+        elif dtype == torch.float16:
+            config.set_flag(trt.BuilderFlag.FP16)
+        logger.info(
+            "mixed-precision level 4: %s builder flag ON + ONNX-level FFN BF16 + "
+            "level 2 TRT constraints (attention FP32)",
+            dtype,
+        )
+    elif dtype == torch.float16:
         config.set_flag(trt.BuilderFlag.FP16)
     elif dtype == torch.bfloat16:
         config.set_flag(trt.BuilderFlag.BF16)
@@ -293,6 +529,12 @@ def convert_onnx_to_trt(
             for i in range(parser.num_errors):
                 logger.error("ONNX parse error: %s", parser.get_error(i))
             raise RuntimeError(f"Failed to parse ONNX model {onnx_path}")
+
+    if mixed_precision == 4:
+        # Level 4: apply level 2 TRT constraints (attention FP32, FFN unconstrained)
+        _apply_mixed_precision(network, config, trt, level=2)
+    elif mixed_precision > 0 and dtype in (torch.float16, torch.bfloat16):
+        _apply_mixed_precision(network, config, trt, level=mixed_precision)
 
     profile = builder.create_optimization_profile()
     for idx, name in enumerate(profiles["input_names"]):
@@ -304,22 +546,25 @@ def convert_onnx_to_trt(
         )
     config.add_optimization_profile(profile)
 
-    # Set I/O dtypes
-    if dtype == torch.float16:
-        tensor_dtype = trt.DataType.HALF
+    # Set I/O dtypes — use FP32 I/O when mixed-precision is enabled
+    # to avoid BF16/FP16 quantization of inputs_embeds and hidden_states.
+    if mixed_precision > 0:
+        io_dtype = trt.DataType.FLOAT
+    elif dtype == torch.float16:
+        io_dtype = trt.DataType.HALF
     elif dtype == torch.bfloat16:
-        tensor_dtype = trt.DataType.BF16
+        io_dtype = trt.DataType.BF16
     else:
-        tensor_dtype = trt.DataType.FLOAT
+        io_dtype = trt.DataType.FLOAT
 
     for i in range(network.num_inputs):
         inp = network.get_input(i)
         if inp.name == "attention_mask":
             inp.dtype = trt.DataType.INT64
         else:
-            inp.dtype = tensor_dtype
+            inp.dtype = io_dtype
     for i in range(network.num_outputs):
-        network.get_output(i).dtype = tensor_dtype
+        network.get_output(i).dtype = io_dtype
 
     engine_bytes = builder.build_serialized_network(network, config)
     assert engine_bytes is not None, "TRT engine build failed"
@@ -408,6 +653,18 @@ def get_parser() -> argparse.ArgumentParser:
         type=float,
         default=512,
         help="data_max parameter for modelopt autocast.",
+    )
+    p.add_argument(
+        "--mixed-precision",
+        type=int,
+        default=0,
+        choices=[0, 1, 2, 3, 4],
+        help="Layer-level FP32 precision constraints. "
+        "0: off (pure BF16/FP16). "
+        "1: non-MatMul → FP32 (Softmax, LayerNorm, ElementWise). "
+        "2: level 1 + attention MatMul → FP32 (only FFN MatMul stays BF16). "
+        "3: ALL layers → FP32 (BF16 only for I/O, quality ≈ FP32 TRT). "
+        "4: ONNX-level FFN BF16 + BF16 flag + attention FP32 constraints.",
     )
     return p
 
@@ -499,6 +756,12 @@ def main():
     else:
         trt_input_onnx = onnx_path
 
+    # 3b. ONNX-level mixed precision for level 4
+    if args.mixed_precision == 4:
+        onnx_mp_path = str(out_dir / "llm.onnx_mp4.onnx")
+        _apply_onnx_mixed_precision(trt_input_onnx, onnx_mp_path)
+        trt_input_onnx = onnx_mp_path
+
     # 4. Build TRT engine
     profiles = get_trt_profiles(
         hidden_size=hidden_size,
@@ -512,7 +775,10 @@ def main():
     trt_path = str(out_dir / args.trt_engine_name)
     _dtype_map = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}
     trt_dtype = _dtype_map[args.dtype]
-    convert_onnx_to_trt(trt_path, trt_input_onnx, profiles, dtype=trt_dtype)
+    convert_onnx_to_trt(
+        trt_path, trt_input_onnx, profiles,
+        dtype=trt_dtype, mixed_precision=args.mixed_precision,
+    )
 
     logger.info("Done!  TRT engine: %s", trt_path)
 
