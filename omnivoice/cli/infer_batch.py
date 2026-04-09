@@ -236,6 +236,13 @@ def get_parser():
         help="Path to a TensorRT engine (.plan) for the LLM backbone. "
         "If set, replaces the PyTorch LLM with a TRT engine.",
     )
+    parser.add_argument(
+        "--trt_start_step",
+        type=int,
+        default=1,
+        help="When using TRT, start TRT from this step (1-indexed). "
+        "Steps before this use the torch LLM. Default: 1 (all steps use TRT).",
+    )
     return parser
 
 
@@ -245,6 +252,7 @@ def process_init(
     warmup=0,
     attn_implementation=None,
     llm_trt_engine_path=None,
+    trt_start_step=1,
 ):
     """Initializer for each worker process.
 
@@ -287,7 +295,12 @@ def process_init(
     if llm_trt_engine_path:
         from omnivoice.utils.tensorrt import load_llm_trt
 
-        load_llm_trt(worker_model, llm_trt_engine_path, device=worker_device)
+        load_llm_trt(
+            worker_model,
+            llm_trt_engine_path,
+            device=worker_device,
+            keep_torch_llm=(trt_start_step > 1),
+        )
 
     if warmup > 0:
         logging.info(f"Running {warmup} warmup iterations on {worker_device}")
@@ -528,7 +541,7 @@ def main():
         with ProcessPoolExecutor(
             max_workers=num_processes,
             initializer=process_init,
-            initargs=(rank_queue, args.model, args.warmup, args.attn_implementation, args.llm_trt_engine_path),
+            initargs=(rank_queue, args.model, args.warmup, args.attn_implementation, args.llm_trt_engine_path, args.trt_start_step),
         ) as executor:
             futures = []
 

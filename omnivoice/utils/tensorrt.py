@@ -33,7 +33,7 @@ class _TrtConfigProxy:
     _attn_implementation = "trt"
 
 
-class TrtLLMWrapper:
+class TrtLLMWrapper(torch.nn.Module):
     """Drop-in replacement for ``model.llm`` that runs TensorRT inference.
 
     The wrapper matches the calling convention used in
@@ -47,7 +47,7 @@ class TrtLLMWrapper:
         )
         hidden_states = llm_outputs[0]
 
-    So ``__call__`` returns a tuple whose first element is the hidden-state
+    So ``forward`` returns a tuple whose first element is the hidden-state
     tensor.
     """
 
@@ -67,10 +67,11 @@ class TrtLLMWrapper:
         device: str = "cuda:0",
         input_embeddings: Optional[torch.nn.Module] = None,
     ):
+        super().__init__()
         self.trt_context_pool: queue.Queue = queue.Queue(maxsize=trt_concurrent)
         self.trt_engine = trt_engine
         self.hidden_size = hidden_size
-        self.device = device
+        self._device = device
         self.config = _TrtConfigProxy()
         self._input_embeddings = input_embeddings
 
@@ -105,7 +106,7 @@ class TrtLLMWrapper:
 
     # ------------------------------------------------------------------
 
-    def __call__(
+    def forward(
         self,
         inputs_embeds: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
@@ -169,6 +170,7 @@ def load_llm_trt(
     trt_engine_path: str,
     trt_concurrent: int = 1,
     device: Optional[str] = None,
+    keep_torch_llm: bool = False,
 ) -> None:
     """Replace ``model.llm`` with a :class:`TrtLLMWrapper`.
 
@@ -177,6 +179,9 @@ def load_llm_trt(
         trt_engine_path: Path to the serialised TRT engine (``.plan``).
         trt_concurrent: Number of concurrent TRT execution contexts.
         device: CUDA device string.  Defaults to ``model.device``.
+        keep_torch_llm: If ``True``, keep the original torch LLM as
+            ``model._torch_llm`` for hybrid mode (first steps use torch,
+            later steps use TRT).
     """
     assert os.path.exists(trt_engine_path), (
         f"TRT engine not found at {trt_engine_path}. "
@@ -197,12 +202,25 @@ def load_llm_trt(
         device = str(model.device)
 
     input_embeddings = model.llm.get_input_embeddings()
-    del model.llm
-    model.llm = TrtLLMWrapper(
+
+    trt_wrapper = TrtLLMWrapper(
         engine,
         hidden_size=hidden_size,
         trt_concurrent=trt_concurrent,
         device=device,
         input_embeddings=input_embeddings,
     )
-    logger.info("LLM replaced with TRT engine (hidden_size=%d).", hidden_size)
+
+    if keep_torch_llm:
+        model._torch_llm = model.llm
+        model._trt_llm = trt_wrapper
+        model.llm = trt_wrapper
+        logger.info(
+            "LLM replaced with TRT engine (hidden_size=%d). "
+            "Original torch LLM kept as model._torch_llm for hybrid mode.",
+            hidden_size,
+        )
+    else:
+        del model.llm
+        model.llm = trt_wrapper
+        logger.info("LLM replaced with TRT engine (hidden_size=%d).", hidden_size)

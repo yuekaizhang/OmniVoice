@@ -100,6 +100,7 @@ class OmniVoiceGenerationConfig:
     postprocess_output: bool = True
     audio_chunk_duration: float = 15.0
     audio_chunk_threshold: float = 30.0
+    trt_start_step: int = 1
 
     @classmethod
     def from_dict(cls, kwargs_dict):
@@ -402,10 +403,9 @@ class OmniVoice(PreTrainedModel):
         )
         hidden_states = llm_outputs[0]
 
-        # Upcast to FP32 before audio_heads when using TRT to avoid
-        # BF16 precision loss accumulating through the projection.
-        if getattr(self.llm, "_is_trt", False):
-            hidden_states = hidden_states.float()
+        # Upcast to FP32 before audio_heads to avoid precision loss
+        # (BF16 from TRT, FP16 from torch LLM in hybrid mode, etc.).
+        hidden_states = hidden_states.float()
 
         loss = None
 
@@ -1168,6 +1168,19 @@ class OmniVoice(PreTrainedModel):
         use_trt = getattr(self.llm, "_is_trt", False)
         use_2d_mask = use_flash or use_trt
 
+        # Hybrid TRT mode: first steps use torch LLM, later steps use TRT
+        _hybrid = (
+            hasattr(self, '_torch_llm')
+            and hasattr(self, '_trt_llm')
+            and gen_config.trt_start_step > 1
+        )
+        if _hybrid:
+            _torch_use_flash = (
+                getattr(self._torch_llm.config, "_attn_implementation", None)
+                == "flash_attention_2"
+            )
+            _torch_use_2d = _torch_use_flash
+
         if use_2d_mask:
             # 2D padding mask — flash_attention_2 / TRT handle it internally
             batch_attention_mask = torch.zeros(
@@ -1176,6 +1189,15 @@ class OmniVoice(PreTrainedModel):
         else:
             # 4D bidirectional mask — for SDPA/eager fallback
             batch_attention_mask = torch.zeros(
+                (2 * B, 1, max_c_len, max_c_len), dtype=torch.bool, device=self.device
+            )
+
+        # In hybrid mode, build both mask types for per-step swapping
+        if _hybrid:
+            _batch_attn_mask_2d = torch.zeros(
+                (2 * B, max_c_len), dtype=torch.bool, device=self.device
+            )
+            _batch_attn_mask_4d = torch.zeros(
                 (2 * B, 1, max_c_len, max_c_len), dtype=torch.bool, device=self.device
             )
 
@@ -1197,6 +1219,13 @@ class OmniVoice(PreTrainedModel):
                 batch_attention_mask[B + i, :u_len] = True
             else:
                 batch_attention_mask[B + i, :, :u_len, :u_len] = True
+
+            # Fill both mask types for hybrid mode
+            if _hybrid:
+                _batch_attn_mask_2d[i, :c_len] = True
+                _batch_attn_mask_4d[i, :, :c_len, :c_len] = True
+                _batch_attn_mask_2d[B + i, :u_len] = True
+                _batch_attn_mask_4d[B + i, :, :u_len, :u_len] = True
 
         tokens = torch.full(
             (B, self.config.num_audio_codebook, max(task.target_lens)),
@@ -1237,7 +1266,26 @@ class OmniVoice(PreTrainedModel):
         if use_flash:
             forward_kwargs["is_causal"] = False
 
+        if _hybrid:
+            _orig_llm = self.llm
+
         for step in range(gen_config.num_step):
+            # Hybrid mode: swap LLM and mask based on step (trt_start_step is 1-indexed)
+            if _hybrid:
+                if step + 1 < gen_config.trt_start_step:
+                    self.llm = self._torch_llm
+                    batch_attention_mask = (
+                        _batch_attn_mask_2d if _torch_use_2d
+                        else _batch_attn_mask_4d
+                    )
+                    forward_kwargs = (
+                        {"is_causal": False} if _torch_use_flash else {}
+                    )
+                else:
+                    self.llm = self._trt_llm
+                    batch_attention_mask = _batch_attn_mask_2d
+                    forward_kwargs = {}
+
             batch_logits = self(
                 input_ids=batch_input_ids,
                 audio_mask=batch_audio_mask,
@@ -1280,6 +1328,10 @@ class OmniVoice(PreTrainedModel):
                 tokens[i : i + 1, :, :t_len] = sample_tokens
                 batch_input_ids[i : i + 1, :, c_len - t_len : c_len] = sample_tokens
                 batch_input_ids[B + i : B + i + 1, :, :t_len] = sample_tokens
+
+        # Restore original LLM after hybrid loop
+        if _hybrid:
+            self.llm = _orig_llm
 
         return [tokens[i, :, : task.target_lens[i]] for i in range(B)]
 
